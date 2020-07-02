@@ -1,23 +1,41 @@
+import itertools
 import os
 import re
-from enum import Enum
-from itertools import chain
-from pathlib import Path
-from typing import Set, Iterable, Union, List, Container, Tuple, Optional
+from abc import ABCMeta, abstractmethod
+from dataclasses import dataclass
 
-import networkx as nx  # type: ignore
+from typing import (
+    Set, Iterator, List, Optional, Dict, Union, Any, Type, Sequence
+)
+from typing_extensions import Protocol
 
+from .graph import Graph, UniqueId
+from .queue import GraphQueue
+from .selector_methods import (
+    MethodName,
+    SelectorMethod,
+    QualifiedNameSelectorMethod,
+    TagSelectorMethod,
+    SourceSelectorMethod,
+    PathSelectorMethod,
+)
 from dbt.logger import GLOBAL_LOGGER as logger
-from dbt.utils import coalesce
 from dbt.node_types import NodeType
 from dbt.exceptions import RuntimeException, InternalException, warn_or_error
+from dbt.contracts.graph.compiled import NonSourceNode, CompileResultNode
+from dbt.contracts.graph.manifest import Manifest
+from dbt.contracts.graph.parsed import ParsedSourceDefinition
 
-SELECTOR_PARENTS = r'^(?P<depth>[0-9]*)\+(?P<node>.*)$'
-SELECTOR_CHILDREN = r'^(?P<node>.*)\+(?P<depth>[0-9]*)$'
-SELECTOR_GLOB = '*'
-SELECTOR_CHILDREN_AND_ANCESTORS = '@'
-SELECTOR_DELIMITER = ':'
-SPEC_DELIMITER = ' '
+
+RAW_SELECTOR_PATTERN = re.compile(
+    r'\A'
+    r'(?P<childs_parents>(\@))?'
+    r'(?P<parents>((?P<parents_depth>(\d*))\+))?'
+    r'((?P<method>(\w+)):)?(?P<value>(.*?))'
+    r'(?P<children>(\+(?P<children_depth>(\d*))))?'
+    r'\Z'
+)
+
 INTERSECTION_DELIMITER = ','
 
 
@@ -33,65 +51,198 @@ def _probably_path(value: str):
         return False
 
 
+def _match_to_int(match: Dict[str, str], key: str) -> Optional[int]:
+    raw = match.get(key)
+    # turn the empty string into None, too.
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise RuntimeException(
+            f'Invalid node spec - could not handle parent depth {raw}'
+        ) from exc
+
+
+SelectionSpecComponent = Union[
+    'SelectionCriteria',
+    'SelectionIntersection',
+    'SelectionDifference',
+    'SelectionUnion',
+]
+
+
+@dataclass
 class SelectionCriteria:
-    def __init__(self, node_spec: str):
-        self.raw = node_spec
-        self.select_children = False
-        self.select_children_max_depth = None
-        self.select_parents = False
-        self.select_parents_max_depth = None
-        self.select_childrens_parents = False
+    raw: str
+    method: MethodName
+    value: str
+    select_childrens_parents: bool
+    select_parents: bool
+    select_parents_max_depth: Optional[int]
+    select_children: bool
+    select_children_max_depth: Optional[int]
 
-        if node_spec.startswith(SELECTOR_CHILDREN_AND_ANCESTORS):
-            self.select_childrens_parents = True
-            node_spec = node_spec[1:]
-
-        matches = re.match(SELECTOR_PARENTS, node_spec)
-        if matches:
-            self.select_parents = True
-            if matches['depth']:
-                self.select_parents_max_depth = int(matches['depth'])
-            node_spec = matches['node']
-
-        matches = re.match(SELECTOR_CHILDREN, node_spec)
-        if matches:
-            self.select_children = True
-            if matches['depth']:
-                self.select_children_max_depth = int(matches['depth'])
-            node_spec = matches['node']
-
+    def __post_init__(self):
         if self.select_children and self.select_childrens_parents:
             raise RuntimeException(
-                'Invalid node spec {} - "@" prefix and "+" suffix are '
-                'incompatible'.format(self.raw)
+                f'Invalid node spec {self.raw} - "@" prefix and "+" suffix '
+                'are incompatible'
             )
 
-        if SELECTOR_DELIMITER in node_spec:
-            selector_parts = node_spec.split(SELECTOR_DELIMITER, 1)
-            selector_type, self.selector_value = selector_parts
-            self.selector_type = SELECTOR_FILTERS(selector_type)
+    @classmethod
+    def default_method(cls, value: str) -> MethodName:
+        if _probably_path(value):
+            return MethodName.Path
         else:
-            self.selector_value = node_spec
-            # if the selector type has an OS path separator in it, it can't
-            # really be a valid file name, so assume it's a path.
-            if _probably_path(node_spec):
-                self.selector_type = SELECTOR_FILTERS.PATH
-            else:
-                self.selector_type = SELECTOR_FILTERS.FQN
+            return MethodName.FQN
+
+    @classmethod
+    def parse_method(cls, raw: str, groupdict: Dict[str, Any]) -> MethodName:
+        raw_method = groupdict.get('method')
+        if raw_method is None:
+            return cls.default_method(groupdict['value'])
+
+        try:
+            return MethodName(raw_method)
+        except ValueError:
+            raise RuntimeException(
+                f'unknown selector filter "{raw_method}" in "{raw}"'
+            ) from None
+
+    @classmethod
+    def from_single_spec(cls, raw: str) -> 'SelectionCriteria':
+        result = RAW_SELECTOR_PATTERN.match(raw)
+        if result is None:
+            # bad spec!
+            raise RuntimeException(f'Invalid selector spec "{raw}"')
+        result_dict = result.groupdict()
+
+        if 'value' not in result_dict:
+            raise RuntimeException(
+                f'Invalid node spec "{raw}" - no search value!'
+            )
+
+        method = cls.parse_method(raw, result_dict)
+
+        parents_max_depth = _match_to_int(result_dict, 'parents_depth')
+        children_max_depth = _match_to_int(result_dict, 'children_depth')
+
+        return cls(
+            raw=raw,
+            method=method,
+            value=result_dict['value'],
+            select_childrens_parents=bool(result_dict.get('childs_parents')),
+            select_parents=bool(result_dict.get('parents')),
+            select_parents_max_depth=parents_max_depth,
+            select_children=bool(result_dict.get('children')),
+            select_children_max_depth=children_max_depth,
+        )
+
+    def collect_models(
+        self, graph: Graph, selected: Set[UniqueId]
+    ) -> Set[UniqueId]:
+        additional: Set[UniqueId] = set()
+        if self.select_childrens_parents:
+            additional.update(graph.select_childrens_parents(selected))
+        if self.select_parents:
+            additional.update(
+                graph.select_parents(selected, self.select_parents_max_depth)
+            )
+        if self.select_children:
+            additional.update(
+                graph.select_children(selected, self.select_children_max_depth)
+            )
+        return additional
 
 
-def split_intersection_blocks(spec):
-    return spec.split(INTERSECTION_DELIMITER)
+class SelectorProtocol(Protocol):
+    def get_nodes_from_spec(
+        self,
+        graph: Graph,
+        spec: SelectionCriteria,
+    ) -> Set[str]:
+        ...
+
+    def get_selected(self) -> Set[str]:
+        ...
 
 
-class SELECTOR_FILTERS(str, Enum):
-    FQN = 'fqn'
-    TAG = 'tag'
-    SOURCE = 'source'
-    PATH = 'path'
+class BaseSelectionGroup(metaclass=ABCMeta):
+    def __init__(
+        self,
+        components: Sequence[SelectionSpecComponent],
+        expect_exists: bool = False,
+        raw: Any = None,
+    ):
+        self.components: List[SelectionSpecComponent] = list(components)
+        self.expect_exists = expect_exists
+        self.raw = raw
 
-    def __str__(self):
-        return self._value_
+    def __iter__(self) -> Iterator[SelectionSpecComponent]:
+        for component in self.components:
+            yield component
+
+    @abstractmethod
+    def combine_selections(self, selections: List[Set[str]]) -> Set[str]:
+        raise NotImplementedError(
+            '_combine_selections not implemented!'
+        )
+
+
+class SelectionIntersection(BaseSelectionGroup):
+    def combine_selections(self, selections: List[Set[str]]) -> Set[str]:
+        return set.intersection(*selections)
+
+
+class SelectionDifference(BaseSelectionGroup):
+    def combine_selections(self, selections: List[Set[str]]) -> Set[str]:
+        return set.difference(*selections)
+
+
+class SelectionUnion(BaseSelectionGroup):
+    def combine_selections(self, selections: List[Set[str]]) -> Set[str]:
+        return set.union(*selections)
+
+
+def _parse_union_from_default(
+    raw: Optional[List[str]], default: List[str]
+) -> SelectionUnion:
+    raw_components: List[str]
+    if raw is None:
+        expect_exists = False
+        raw_components = default
+    else:
+        expect_exists = True
+        raw_components = raw
+
+    # turn ['a b', 'c'] -> ['a', 'b', 'c']
+    raw_specs = itertools.chain.from_iterable(
+        r.split(' ') for r in raw_components
+    )
+    union_components: List[SelectionSpecComponent] = []
+
+    # ['a', 'b', 'c,d'] -> union('a', 'b', intersection('c', 'd'))
+    for raw_spec in raw_specs:
+        intersection_components: List[SelectionSpecComponent] = [
+            SelectionCriteria.from_single_spec(part)
+            for part in raw_spec.split(INTERSECTION_DELIMITER)
+        ]
+        union_components.append(SelectionIntersection(
+            components=intersection_components,
+            expect_exists=expect_exists,
+            raw=raw_spec,
+        ))
+
+    return SelectionUnion(
+        components=union_components,
+        expect_exists=expect_exists,
+        raw=raw_components,
+    )
+
+
+def get_package_names(nodes):
+    return set([node.split(".")[1] for node in nodes])
 
 
 def alert_non_existence(raw_spec, nodes):
@@ -102,459 +253,187 @@ def alert_non_existence(raw_spec, nodes):
         )
 
 
-def split_specs(node_specs: Iterable[str]):
-    specs: Set[str] = set()
-    for spec in node_specs:
-        parts = spec.split(SPEC_DELIMITER)
-        specs.update(parts)
-
-    return specs
-
-
-def get_package_names(nodes):
-    return set([node.split(".")[1] for node in nodes])
-
-
-def is_selected_node(real_node, node_selector):
-    for i, selector_part in enumerate(node_selector):
-
-        is_last = (i == len(node_selector) - 1)
-
-        # if we hit a GLOB, then this node is selected
-        if selector_part == SELECTOR_GLOB:
-            return True
-
-        # match package.node_name or package.dir.node_name
-        elif is_last and selector_part == real_node[-1]:
-            return True
-
-        elif len(real_node) <= i:
-            return False
-
-        elif real_node[i] == selector_part:
-            continue
-
-        else:
-            return False
-
-    # if we get all the way down here, then the node is a match
-    return True
-
-
-def _node_is_match(
-    qualified_name: List[str], package_names: Set[str], fqn: List[str]
-) -> bool:
-    """Determine if a qualfied name matches an fqn, given the set of package
-    names in the graph.
-
-    :param List[str] qualified_name: The components of the selector or node
-        name, split on '.'.
-    :param Set[str] package_names: The set of pacakge names in the graph.
-    :param List[str] fqn: The node's fully qualified name in the graph.
-    """
-    if len(qualified_name) == 1 and fqn[-1] == qualified_name[0]:
-        return True
-
-    if qualified_name[0] in package_names:
-        if is_selected_node(fqn, qualified_name):
-            return True
-
-    for package_name in package_names:
-        local_qualified_node_name = [package_name] + qualified_name
-        if is_selected_node(fqn, local_qualified_node_name):
-            return True
-
-    return False
-
-
-class ManifestSelector:
-    FILTER: str
-
-    def __init__(self, manifest):
-        self.manifest = manifest
-
-    def _node_iterator(
-        self,
-        included_nodes: Set[str],
-        exclude: Optional[Container[str]],
-        include: Optional[Container[str]],
-    ) -> Iterable[Tuple[str, str]]:
-        for unique_id, node in self.manifest.nodes.items():
-            if unique_id not in included_nodes:
-                continue
-            if include is not None and node.resource_type not in include:
-                continue
-            if exclude is not None and node.resource_type in exclude:
-                continue
-            yield unique_id, node
-
-    def parsed_nodes(self, included_nodes):
-        for unique_id, node in self.manifest.nodes.items():
-            if unique_id not in included_nodes:
-                continue
-            yield unique_id, node
-
-    def source_nodes(self, included_nodes):
-        for unique_id, source in self.manifest.sources.items():
-            if unique_id not in included_nodes:
-                continue
-            yield unique_id, source
-
-    def search(self, included_nodes, selector):
-        raise NotImplementedError('subclasses should implement this')
-
-
-class QualifiedNameSelector(ManifestSelector):
-    FILTER = SELECTOR_FILTERS.FQN
-
-    def search(self, included_nodes, selector):
-        """Yield all nodes in the graph that match the selector.
-
-        :param str selector: The selector or node name
-        """
-        qualified_name = selector.split(".")
-        package_names = get_package_names(included_nodes)
-        for node, real_node in self.parsed_nodes(included_nodes):
-            if _node_is_match(qualified_name, package_names, real_node.fqn):
-                yield node
-
-
-class TagSelector(ManifestSelector):
-    FILTER = SELECTOR_FILTERS.TAG
-
-    def search(self, included_nodes, selector):
-        """ yields nodes from graph that have the specified tag """
-        search = chain(self.parsed_nodes(included_nodes),
-                       self.source_nodes(included_nodes))
-        for node, real_node in search:
-            if selector in real_node.tags:
-                yield node
-
-
-class SourceSelector(ManifestSelector):
-    FILTER = SELECTOR_FILTERS.SOURCE
-
-    def search(self, included_nodes, selector):
-        """yields nodes from graph are the specified source."""
-        parts = selector.split('.')
-        target_package = SELECTOR_GLOB
-        if len(parts) == 1:
-            target_source, target_table = parts[0], None
-        elif len(parts) == 2:
-            target_source, target_table = parts
-        elif len(parts) == 3:
-            target_package, target_source, target_table = parts
-        else:  # len(parts) > 3 or len(parts) == 0
-            msg = (
-                'Invalid source selector value "{}". Sources must be of the '
-                'form `${{source_name}}`, '
-                '`${{source_name}}.${{target_name}}`, or '
-                '`${{package_name}}.${{source_name}}.${{target_name}}'
-            ).format(selector)
-            raise RuntimeException(msg)
-
-        for node, real_node in self.source_nodes(included_nodes):
-            if target_package not in (real_node.package_name, SELECTOR_GLOB):
-                continue
-            if target_source not in (real_node.source_name, SELECTOR_GLOB):
-                continue
-            if target_table in (None, real_node.name, SELECTOR_GLOB):
-                yield node
-
-
-class PathSelector(ManifestSelector):
-    FILTER = SELECTOR_FILTERS.PATH
-
-    def search(self, included_nodes, selector):
-        """Yield all nodes in the graph that match the given path.
-
-        :param str selector: The path selector
-        """
-        # use '.' and not 'root' for easy comparison
-        root = Path.cwd()
-        paths = set(p.relative_to(root) for p in root.glob(selector))
-        search = chain(self.parsed_nodes(included_nodes),
-                       self.source_nodes(included_nodes))
-        for node, real_node in search:
-            if Path(real_node.root_path) != root:
-                continue
-            ofp = Path(real_node.original_file_path)
-            if ofp in paths:
-                yield node
-            elif any(parent in paths for parent in ofp.parents):
-                yield node
-
-
 class InvalidSelectorError(Exception):
     pass
 
 
-ValidSelector = Union[QualifiedNameSelector, TagSelector, SourceSelector]
+DEFAULT_INCLUDES: List[str] = ['fqn:*', 'source:*']
+DEFAULT_EXCLUDES: List[str] = []
 
 
-class MultiSelector:
-    """The base class of the node selector. It only about the manifest and
-    selector types, including the glob operator, but does not handle any graph
-    related behavior.
+class NodeSelector:
+    """The node selector is aware of the graph and manifest,
     """
-    SELECTORS = [
-        QualifiedNameSelector,
-        TagSelector,
-        SourceSelector,
-        PathSelector,
-    ]
+    SELECTOR_METHODS: Dict[str, Type[SelectorMethod]] = {}
 
-    def __init__(self, manifest):
-        self.manifest = manifest
-
-    def get_selector(
-        self, selector_type: str
+    def __init__(
+        self,
+        graph: Graph,
+        manifest: Manifest,
+        include: Optional[List[str]] = None,
+        exclude: Optional[List[str]] = None,
     ):
-        for cls in self.SELECTORS:
-            if cls.FILTER == selector_type:
-                return cls(self.manifest)
+        self.full_graph = graph
+        self.manifest = manifest
+        self.include = include
+        self.exclude = exclude
 
-        raise InvalidSelectorError(selector_type)
+    @classmethod
+    def register_method(cls, name, selector: Type[SelectorMethod]):
+        cls.SELECTOR_METHODS[name] = selector
 
-    def select_included(self, included_nodes, selector_type, selector_value):
-        selector = self.get_selector(selector_type)
-        return set(selector.search(included_nodes, selector_value))
+    def get_selector(self, method: str) -> SelectorMethod:
+        if method in self.SELECTOR_METHODS:
+            cls: Type[SelectorMethod] = self.SELECTOR_METHODS[method]
+            return cls(self.manifest)
+        else:
+            raise InvalidSelectorError(method)
 
-
-class Graph:
-    """A wrapper around the networkx graph that understands SelectionCriteria
-    and how they interact with the graph.
-    """
-    def __init__(self, graph):
-        self.graph = graph
-
-    def nodes(self):
-        return set(self.graph.nodes())
-
-    def __iter__(self):
-        return iter(self.graph.nodes())
-
-    def select_childrens_parents(self, selected: Set[str]) -> Set[str]:
-        ancestors_for = self.select_children(selected) | selected
-        return self.select_parents(ancestors_for) | ancestors_for
-
-    def descendants(self, node, max_depth: Optional[int] = None) -> Set[str]:
-        """Returns all nodes reachable from `node` in `graph`"""
-        if not self.graph.has_node(node):
-            raise InternalException(f'Node {node} not found in the graph!')
-        des = nx.single_source_shortest_path_length(G=self.graph,
-                                                    source=node,
-                                                    cutoff=max_depth)\
-            .keys()
-        return des - {node}
-
-    def ancestors(self, node, max_depth: Optional[int] = None) -> Set[str]:
-        """Returns all nodes having a path to `node` in `graph`"""
-        if not self.graph.has_node(node):
-            raise InternalException(f'Node {node} not found in the graph!')
-        with nx.utils.reversed(self.graph):
-            anc = nx.single_source_shortest_path_length(G=self.graph,
-                                                        source=node,
-                                                        cutoff=max_depth)\
-                .keys()
-        return anc - {node}
-
-    def select_children(self,
-                        selected: Set[str],
-                        max_depth: Optional[int] = None) -> Set[str]:
-        descendants: Set[str] = set()
-        for node in selected:
-            descendants.update(self.descendants(node, max_depth=max_depth))
-        return descendants
-
-    def select_parents(self,
-                       selected: Set[str],
-                       max_depth: Optional[int] = None) -> Set[str]:
-        ancestors: Set[str] = set()
-        for node in selected:
-            ancestors.update(self.ancestors(node, max_depth=max_depth))
-        return ancestors
-
-    def select_successors(self, selected: Set[str]) -> Set[str]:
-        successors: Set[str] = set()
-        for node in selected:
-            successors.update(self.graph.successors(node))
-        return successors
-
-    def collect_models(
-        self, selected: Set[str], spec: SelectionCriteria,
+    def select_included(
+        self, included_nodes: Set[str], spec: SelectionCriteria,
     ) -> Set[str]:
-        additional: Set[str] = set()
-        if spec.select_childrens_parents:
-            additional.update(self.select_childrens_parents(selected))
-        if spec.select_parents:
-            additional.update(
-                self.select_parents(selected,
-                                    max_depth=spec.select_parents_max_depth)
-            )
-        if spec.select_children:
-            additional.update(
-                self.select_children(selected,
-                                     max_depth=spec.select_children_max_depth)
-            )
-        return additional
+        selector = self.get_selector(spec.method)
+        return set(selector.search(included_nodes, spec.value))
 
-    def subgraph(self, nodes: Iterable[str]) -> 'Graph':
-        cls = type(self)
-        return cls(self.graph.subgraph(nodes))
-
-
-class NodeSelector(MultiSelector):
-    def __init__(self, graph, manifest):
-        self.full_graph = Graph(graph)
-        super().__init__(manifest)
-
-    def get_nodes_from_spec(self, graph, spec):
+    def get_nodes_from_criteria(
+        self, graph: Graph, spec: SelectionCriteria
+    ) -> Set[str]:
+        nodes = graph.nodes()
         try:
-            collected = self.select_included(graph.nodes(),
-                                             spec.selector_type,
-                                             spec.selector_value)
+            collected = self.select_included(nodes, spec)
         except InvalidSelectorError:
-            valid_selectors = ", ".join(s.FILTER for s in self.SELECTORS)
-            logger.info("The '{}' selector specified in {} is invalid. Must "
-                        "be one of [{}]".format(
-                            spec.selector_type,
-                            spec.raw,
-                            valid_selectors))
+            valid_selectors = ", ".join(self.SELECTOR_METHODS)
+            logger.info(
+                f"The '{spec.method}' selector specified in {spec.raw} is "
+                f"invalid. Must be one of [{valid_selectors}]"
+            )
             return set()
 
-        specified = graph.collect_models(collected, spec)
+        specified = spec.collect_models(graph, collected)
         collected.update(specified)
+        result = self.expand_selection(graph, collected)
+        return result
 
-        tests = {
-            n for n in graph.select_successors(collected)
-            if self.manifest.nodes[n].resource_type == NodeType.Test
-        }
-        collected.update(tests)
+    def get_nodes_from_selection_spec(
+        self, graph: Graph, spec: SelectionSpecComponent
+    ) -> Set[str]:
+        if isinstance(spec, SelectionCriteria):
+            result = self.get_nodes_from_criteria(graph, spec)
+        else:
+            node_selections = [
+                self.get_nodes_from_selection_spec(graph, component)
+                for component in spec
+            ]
+            if node_selections:
+                result = spec.combine_selections(node_selections)
+            else:
+                result = set()
+            if spec.expect_exists:
+                alert_non_existence(spec.raw, result)
+        return result
 
-        return collected
+    def select_nodes(self, graph: Graph) -> Set[str]:
+        included = _parse_union_from_default(self.include, DEFAULT_INCLUDES)
+        excluded = _parse_union_from_default(self.exclude, DEFAULT_EXCLUDES)
 
-    def get_nodes_from_intersection_spec(self, graph, raw_spec):
-        return set.intersection(
-            *[self.get_nodes_from_spec(graph, SelectionCriteria(
-                intersection_block_spec)) for intersection_block_spec in
-              split_intersection_blocks(raw_spec)]
-        )
+        full_selection = SelectionDifference(components=[included, excluded])
+        return self.get_nodes_from_selection_spec(graph, full_selection)
 
-    def get_nodes_from_multiple_specs(
-            self,
-            graph,
-            specs,
-            nodes=None,
-            check_existence=False,
-            exclude=False
-    ):
-        selected_nodes: Set[str] = coalesce(nodes, set())
-        operator = set.difference_update if exclude else set.update
-
-        for raw_spec in split_specs(specs):
-            nodes = self.get_nodes_from_intersection_spec(graph, raw_spec)
-
-            if check_existence:
-                alert_non_existence(raw_spec, nodes)
-
-            operator(selected_nodes, nodes)
-
-        return selected_nodes
-
-    def select_nodes(self, graph, raw_include_specs, raw_exclude_specs):
-        raw_exclude_specs = coalesce(raw_exclude_specs, [])
-        check_existence = True
-
-        if not raw_include_specs:
-            check_existence = False
-            raw_include_specs = ['fqn:*', 'source:*']
-
-        selected_nodes = self.get_nodes_from_multiple_specs(
-            graph,
-            raw_include_specs,
-            check_existence=check_existence
-        )
-        selected_nodes = self.get_nodes_from_multiple_specs(
-            graph,
-            raw_exclude_specs,
-            nodes=selected_nodes,
-            exclude=True
-        )
-
-        return selected_nodes
-
-    def _is_graph_member(self, node_name):
-        if node_name in self.manifest.sources:
-            return True
-        node = self.manifest.nodes[node_name]
+    def _is_graph_member(self, unique_id: str) -> bool:
+        if unique_id in self.manifest.sources:
+            source = self.manifest.sources[unique_id]
+            return source.config.enabled
+        node = self.manifest.nodes[unique_id]
         return not node.empty and node.config.enabled
 
-    def _is_match(self, node_name, resource_types, tags, required):
-        if node_name in self.manifest.nodes:
-            node = self.manifest.nodes[node_name]
-        elif node_name in self.manifest.sources:
-            node = self.manifest.sources[node_name]
-        else:
-            raise InternalException(
-                f'Node {node_name} not found in the manifest!'
-            )
-        if node.resource_type not in resource_types:
-            return False
-        tags = set(tags)
-        if tags and not bool(set(node.tags) & tags):
-            # there are tags specified but none match
-            return False
-        for attr in required:
-            if not getattr(node, attr):
-                return False
+    def node_is_match(
+        self,
+        node: Union[ParsedSourceDefinition, NonSourceNode],
+    ) -> bool:
         return True
 
-    def get_selected(self, include, exclude, resource_types, tags, required):
-        tags = coalesce(tags, [])
+    def _is_match(self, unique_id: str) -> bool:
+        node: CompileResultNode
+        if unique_id in self.manifest.nodes:
+            node = self.manifest.nodes[unique_id]
+        elif unique_id in self.manifest.sources:
+            node = self.manifest.sources[unique_id]
+        else:
+            raise InternalException(
+                f'Node {unique_id} not found in the manifest!'
+            )
+        return self.node_is_match(node)
 
+    def build_graph_member_subgraph(self) -> Graph:
         graph_members = {
-            node_name for node_name in self.full_graph.nodes()
-            if self._is_graph_member(node_name)
+            unique_id for unique_id in self.full_graph.nodes()
+            if self._is_graph_member(unique_id)
         }
-        filtered_graph = self.full_graph.subgraph(graph_members)
-        selected_nodes = self.select_nodes(filtered_graph, include, exclude)
+        return self.full_graph.subgraph(graph_members)
 
-        filtered_nodes = set()
-        for node_name in selected_nodes:
-            if self._is_match(node_name, resource_types, tags, required):
-                filtered_nodes.add(node_name)
+    def filter_selection(self, selected: Set[str]) -> Set[str]:
+        return {
+            unique_id for unique_id in selected if self._is_match(unique_id)
+        }
 
+    def expand_selection(
+        self, filtered_graph: Graph, selected: Set[str]
+    ) -> Set[str]:
+        return selected
+
+    def get_selected(self) -> Set[str]:
+        """get_selected runs trhough the node selection process:
+
+            - build a subgraph containing only non-empty, enabled nodes and
+                enabled sources
+            - node selection occurs. Based on the include/exclude sets, the set
+                of matched unique IDs is returned
+            - the set of selected nodes is expanded (implemented per-task)
+                TODO: this should return a new graph, not a new set of selected
+                nodes!
+                this is where tests are added
+            - filtering (implemented per-task)
+                - on tests: only return data tests/schema tests as selected
+                - node type filtering
+        """
+        filtered_graph = self.build_graph_member_subgraph()
+        selected_nodes = self.select_nodes(filtered_graph)
+        # expanded_nodes = self.expand_selection(filtered_graph, selected_nodes)
+        filtered_nodes = self.filter_selection(selected_nodes)
         return filtered_nodes
 
-    def select(self, query):
-        include = query.get('include')
-        exclude = query.get('exclude')
-        resource_types = query.get('resource_types')
-        tags = query.get('tags')
-        required = query.get('required', ())
-        addin_ephemeral_nodes = query.get('addin_ephemeral_nodes', True)
+    def get_graph_queue(self) -> GraphQueue:
+        """Returns a queue over nodes in the graph that tracks progress of
+        dependecies.
+        """
+        selected_nodes = self.get_selected()
+        new_graph = self.full_graph.get_subset_graph(selected_nodes)
+        # should we give a way here for consumers to mutate the graph?
+        return GraphQueue(new_graph.graph, self.manifest, selected_nodes)
 
-        selected = self.get_selected(include, exclude, resource_types, tags,
-                                     required)
 
-        # if you haven't selected any nodes, return that so we can give the
-        # nice "no models selected" message.
-        if not selected:
-            return selected
+class ResourceTypeSelector(NodeSelector):
+    def __init__(
+        self,
+        graph: Graph,
+        manifest: Manifest,
+        resource_types: List[NodeType],
+        include: Optional[List[str]] = None,
+        exclude: Optional[List[str]] = None,
+    ):
+        super().__init__(
+            graph=graph,
+            manifest=manifest,
+            include=include,
+            exclude=exclude,
+        )
+        self.resource_types: Set[NodeType] = set(resource_types)
 
-        # we used to carefully go through all node ancestors and add those if
-        # they were ephemeral. Sadly, the algorithm we used ended up being
-        # O(n^2). Instead, since ephemeral nodes are almost free, just add all
-        # ephemeral nodes in the graph.
-        # someday at large enough scale we might want to prune it to only be
-        # ancestors of the selected nodes so we can skip the compile.
-        if addin_ephemeral_nodes:
-            addins = {
-                uid for uid, node in self.manifest.nodes.items()
-                if node.is_ephemeral_model
-            }
-        else:
-            addins = set()
+    def node_is_match(self, node):
+        return node.resource_type in self.resource_types
 
-        return selected | addins
+
+NodeSelector.register_method(MethodName.FQN, QualifiedNameSelectorMethod)
+NodeSelector.register_method(MethodName.Tag, TagSelectorMethod)
+NodeSelector.register_method(MethodName.Source, SourceSelectorMethod)
+NodeSelector.register_method(MethodName.Path, PathSelectorMethod)

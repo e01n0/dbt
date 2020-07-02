@@ -8,16 +8,14 @@ import dbt.clients.system
 import dbt.compilation
 import dbt.exceptions
 import dbt.flags
-import dbt.linker
 import dbt.parser
 import dbt.config
 import dbt.utils
 import dbt.parser.manifest
 from dbt.contracts.graph.manifest import FilePath, SourceFile, FileHash, Manifest
-from dbt.contracts.graph.parsed import ParsedMacro
 from dbt.parser.results import ParseResult
 from dbt.parser.base import BaseParser
-from dbt.node_types import NodeType
+from dbt.graph.selector import NodeSelector
 
 try:
     from queue import Empty
@@ -26,7 +24,7 @@ except ImportError:
 
 from dbt.logger import GLOBAL_LOGGER as logger # noqa
 
-from .utils import config_from_parts_or_dicts, generate_name_macros, MockMacro, inject_plugin
+from .utils import config_from_parts_or_dicts, generate_name_macros, inject_plugin
 
 
 class GraphTest(unittest.TestCase):
@@ -288,7 +286,7 @@ class GraphTest(unittest.TestCase):
         config = self.get_config()
         manifest = self.load_manifest(config)
         compiler = self.get_compiler(config)
-        linker = compiler.compile(manifest)
+        graph = compiler.compile(manifest)
 
         models = ('model_1', 'model_2', 'model_3', 'model_4')
         model_ids = ['model.test_models_compile.{}'.format(m) for m in models]
@@ -298,7 +296,8 @@ class GraphTest(unittest.TestCase):
             for n in model_ids
         })
         manifest.expect.side_effect = lambda n: MagicMock(unique_id=n)
-        queue = linker.as_graph_queue(manifest)
+        selector = NodeSelector(graph, manifest)
+        queue = selector.get_graph_queue()
 
         for model_id in model_ids:
             self.assertFalse(queue.empty())

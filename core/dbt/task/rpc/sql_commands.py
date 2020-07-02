@@ -101,11 +101,11 @@ class RemoteRunSQLTask(RPCTask[RPCExecParameters]):
         # this just gets a transitive closure of the nodes. We could build a
         # special GraphQueue around this, but we do them all in the main thread
         # so we only care about preserving dependency order anyway
-        if self.linker is None or self.manifest is None:
+        if self.graph is None or self.manifest is None:
             raise InternalException(
-                'linker and manifest not set in _compile_ancestors'
+                'graph and manifest not set in _compile_ancestors'
             )
-        sorted_ancestors = self.linker.sorted_ephemeral_ancestors(
+        sorted_ancestors = self.graph.sorted_ephemeral_ancestors(
             self.manifest,
             unique_id,
         )
@@ -151,7 +151,7 @@ class RemoteRunSQLTask(RPCTask[RPCExecParameters]):
         )
 
         # don't write our new, weird manifest!
-        self.linker = compile_manifest(self.config, self.manifest, write=False)
+        self.graph = compile_manifest(self.config, self.manifest, write=False)
         self._compile_ancestors(rpc_node.unique_id)
         return rpc_node
 

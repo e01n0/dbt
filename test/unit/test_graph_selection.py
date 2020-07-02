@@ -23,7 +23,6 @@ class BaseGraphSelectionTest(unittest.TestCase):
         }
         self.add_tags(nodes)
         self.manifest = mock.MagicMock(nodes=nodes)
-        self.selector = graph_selector.NodeSelector(self.package_graph, self.manifest)
 
 
 class GraphSelectionTest(BaseGraphSelectionTest):
@@ -48,11 +47,10 @@ class GraphSelectionTest(BaseGraphSelectionTest):
         nodes['m.X.g'].tags = ['efg']
 
     def run_specs_and_assert(self, graph, include, exclude, expected):
-        selected = self.selector.select_nodes(
-            graph,
-            include,
-            exclude
+        selector = graph_selector.NodeSelector(
+            self.package_graph, self.manifest, include, exclude
         )
+        selected = selector.select_nodes(graph)
 
         self.assertEqual(selected, expected)
 
